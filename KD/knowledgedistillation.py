@@ -1,7 +1,6 @@
 import torch 
 import torch.nn as nn
 import torchvision
-# from utils import accuracy
 
 def CurrectlyClassified(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
@@ -22,7 +21,7 @@ def CurrectlyClassified(output, target, topk=(1,)):
         return res
 
 class KnowledgeDistilldation(object):
-    def __init__(self, Teacher, Student, Optimizer, TrainLoader, LossIndicator, ValLoader, device, LossFn, Lambda) -> None:
+    def __init__(self, Teacher, Student, Optimizer, TrainLoader, ValLoader, device, LossFn, LossIndicator, Lambda) -> None:
         self.Teacher = Teacher
         self.Student = Student
         self.LossFn = LossFn
@@ -115,4 +114,3 @@ class KnowledgeDistilldation(object):
         RtLosses = [l/Nsamples for l in RtLosses]
         return {'Losses':RtLosses, 'Top1':Tncc1/Nsamples, "Top5": Tncc5/Nsamples}
     
-breakpoint()

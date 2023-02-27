@@ -1,186 +1,106 @@
 import argparse
-import datetime
-import os
-import time
-
 import torch
-from torch import distributed as dist
-from torch.backends import cudnn
-from torch.nn import DataParallel
-from torch.nn.parallel import DistributedDataParallel
+import os
+from tqdm import tqdm
+import torch.optim as optim
+from models import Model
+from dataloader import get_loader
+from utils import GetModel
+from KD.knowledgedistillation import KnowledgeDistilldation
+from torchvision.transforms import transforms
+from torchvision.datasets.cifar import CIFAR100
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+def loss_kd(preds, labels, teacher_preds, params):
+    T = params.temperature
+    alpha = params.alpha
+    loss = T * T * alpha* F.kl_div(F.log_softmax(preds / T, dim=1), 
+                                   F.softmax(teacher_preds / T, dim=1), reduction='batchmean') + \
+                                \
+             (1. - alpha)*F.cross_entropy(preds, labels)
+    return loss
 
-from torchdistill.common import file_util, yaml_util, module_util
-from torchdistill.common.constant import def_logger
-from torchdistill.common.main_util import is_main_process, init_distributed_mode, load_ckpt, save_ckpt, set_seed
-from torchdistill.core.distillation import get_distillation_box
-from torchdistill.core.training import get_training_box
-from torchdistill.datasets import util
-from torchdistill.eval.classification import compute_accuracy
-from torchdistill.misc.log import setup_log_file, SmoothedValue, MetricLogger
-from torchdistill.models.official import get_image_classification_model
-from torchdistill.models.registry import get_model
-
-logger = def_logger.getChild(__name__)
-
-
-def get_argparser():
-    parser = argparse.ArgumentParser(description='Knowledge distillation for image classification models')
-    parser.add_argument('--config', required=True, help='yaml file path')
-    parser.add_argument('--device', default='cuda', help='device')
-    parser.add_argument('--log', help='log file path')
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
-    parser.add_argument('--seed', type=int, help='seed in random number generator')
-    parser.add_argument('-test_only', action='store_true', help='only test the models')
-    parser.add_argument('-student_only', action='store_true', help='test the student model only')
-    parser.add_argument('-log_config', action='store_true', help='log config')
-    # distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
-    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument('-adjust_lr', action='store_true',
-                        help='multiply learning rate by number of distributed processes (world_size)')
-    return parser
-
-
-def load_model(model_config, device, distributed):
-    model = get_image_classification_model(model_config, distributed)
-    if model is None:
-        repo_or_dir = model_config.get('repo_or_dir', None)
-        model = get_model(model_config['name'], repo_or_dir, **model_config['params'])
-
-    ckpt_file_path = model_config['ckpt']
-    load_ckpt(ckpt_file_path, model=model, strict=True)
-    return model.to(device)
-
-
-def train_one_epoch(training_box, device, epoch, log_freq):
-    metric_logger = MetricLogger(delimiter='  ')
-    metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value}'))
-    metric_logger.add_meter('img/s', SmoothedValue(window_size=10, fmt='{value}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    for sample_batch, targets, supp_dict in \
-            metric_logger.log_every(training_box.train_data_loader, log_freq, header):
-        start_time = time.time()
-        sample_batch, targets = sample_batch.to(device), targets.to(device)
-        loss = training_box(sample_batch, targets, supp_dict)
-        training_box.update_params(loss=loss)
-        batch_size = sample_batch.shape[0]
-        metric_logger.update(loss=loss.item(), lr=training_box.optimizer.param_groups[0]['lr'])
-        metric_logger.meters['img/s'].update(batch_size / (time.time() - start_time))
-        if (torch.isnan(loss) or torch.isinf(loss)) and is_main_process():
-            raise ValueError('The training loop was broken due to loss = {}'.format(loss))
-
-
-@torch.inference_mode()
-def evaluate(model, data_loader, device, device_ids, distributed, log_freq=1000, title=None, header='Test:'):
-    model.to(device)
-    if distributed:
-        model = DistributedDataParallel(model, device_ids=device_ids)
-    elif device.type.startswith('cuda'):
-        model = DataParallel(model, device_ids=device_ids)
-
-    if title is not None:
-        logger.info(title)
-
-    model.eval()
-    metric_logger = MetricLogger(delimiter='  ')
-    for image, target in metric_logger.log_every(data_loader, log_freq, header):
-        image = image.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)
-        output = model(image)
-        acc1, acc5 = compute_accuracy(output, target, topk=(1, 5))
-        # FIXME need to take into account that the datasets
-        # could have been padded in distributed setup
-        batch_size = image.shape[0]
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
-
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    top1_accuracy = metric_logger.acc1.global_avg
-    top5_accuracy = metric_logger.acc5.global_avg
-    logger.info(' * Acc@1 {:.4f}\tAcc@5 {:.4f}\n'.format(top1_accuracy, top5_accuracy))
-    return metric_logger.acc1.global_avg
-
-
-def train(teacher_model, student_model, dataset_dict, ckpt_file_path, device, device_ids, distributed, config, args):
-    logger.info('Start training')
-    train_config = config['train']
-    lr_factor = args.world_size if distributed and args.adjust_lr else 1
-    training_box = get_training_box(student_model, dataset_dict, train_config,
-                                    device, device_ids, distributed, lr_factor) if teacher_model is None \
-        else get_distillation_box(teacher_model, student_model, dataset_dict, train_config,
-                                  device, device_ids, distributed, lr_factor)
-    best_val_top1_accuracy = 0.0
-    optimizer, lr_scheduler = training_box.optimizer, training_box.lr_scheduler
-    if file_util.check_if_exists(ckpt_file_path):
-        best_val_top1_accuracy, _, _ = load_ckpt(ckpt_file_path, optimizer=optimizer, lr_scheduler=lr_scheduler)
-
-    log_freq = train_config['log_freq']
-    student_model_without_ddp = student_model.module if module_util.check_if_wrapped(student_model) else student_model
-    start_time = time.time()
-    for epoch in range(args.start_epoch, training_box.num_epochs):
-        training_box.pre_process(epoch=epoch)
-        train_one_epoch(training_box, device, epoch, log_freq)
-        val_top1_accuracy = evaluate(student_model, training_box.val_data_loader, device, device_ids, distributed,
-                                     log_freq=log_freq, header='Validation:')
-        if val_top1_accuracy > best_val_top1_accuracy and is_main_process():
-            logger.info('Best top-1 accuracy: {:.4f} -> {:.4f}'.format(best_val_top1_accuracy, val_top1_accuracy))
-            logger.info('Updating ckpt at {}'.format(ckpt_file_path))
-            best_val_top1_accuracy = val_top1_accuracy
-            save_ckpt(student_model_without_ddp, optimizer, lr_scheduler,
-                      best_val_top1_accuracy, config, args, ckpt_file_path)
-        training_box.post_process()
-
-    if distributed:
-        dist.barrier()
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info('Training time {}'.format(total_time_str))
-    training_box.clean_modules()
-
+def HardLoss(preds, traget, T=4):
 
 def main(args):
-    log_file_path = args.log
-    if is_main_process() and log_file_path is not None:
-        setup_log_file(os.path.expanduser(log_file_path))
+    Teacher = GetModel(args.teacher_name)
+    Student = GetModel(args.model_name)
+    if not args.device:
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-    distributed, device_ids = init_distributed_mode(args.world_size, args.dist_url)
-    logger.info(args)
-    cudnn.benchmark = True
-    set_seed(args.seed)
-    config = yaml_util.load_yaml_file(os.path.expanduser(args.config))
-    device = torch.device(args.device)
-    dataset_dict = util.get_all_datasets(config['datasets'])
-    models_config = config['models']
-    teacher_model_config = models_config.get('teacher_model', None)
-    teacher_model =\
-        load_model(teacher_model_config, device, distributed) if teacher_model_config is not None else None
-    student_model_config =\
-        models_config['student_model'] if 'student_model' in models_config else models_config['model']
-    ckpt_file_path = student_model_config['ckpt']
-    student_model = load_model(student_model_config, device, distributed)
-    if args.log_config:
-        logger.info(config)
-
-    if not args.test_only:
-        train(teacher_model, student_model, dataset_dict, ckpt_file_path, device, device_ids, distributed, config, args)
-        student_model_without_ddp =\
-            student_model.module if module_util.check_if_wrapped(student_model) else student_model
-        load_ckpt(student_model_config['ckpt'], model=student_model_without_ddp, strict=True)
-
-    test_config = config['test']
-    test_data_loader_config = test_config['test_data_loader']
-    test_data_loader = util.build_data_loader(dataset_dict[test_data_loader_config['dataset_id']],
-                                              test_data_loader_config, distributed)
-    log_freq = test_config.get('log_freq', 1000)
-    if not args.student_only and teacher_model is not None:
-        evaluate(teacher_model, test_data_loader, device, device_ids, distributed, log_freq=log_freq,
-                 title='[Teacher: {}]'.format(teacher_model_config['name']))
-    evaluate(student_model, test_data_loader, device, device_ids, distributed, log_freq=log_freq,
-             title='[Student: {}]'.format(student_model_config['name']))
+    Optimizer = optim.SGD(Student.parameters(), lr=args.lr, momentum=args.momentum)
+    transform = transforms.Compose(
+    [transforms.ToTensor(),
+     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+    train_dataset = CIFAR100('./dataset', train=True, transform=transform, download=True)
+    train_loader = DataLoader(train_dataset, args.batchsize, shuffle=True)
+    val_dataset = CIFAR100('./dataset', train=False, transform=transform, download=True)
+    val_loader = DataLoader(val_dataset, args.batchsize, shuffle=False)
+    LossFn = []
+    LossIndicator=["H", "S"]
+    Lambda=[0.5, 0.5]
+    KD = KnowledgeDistilldation(Teacher=Teacher, Student=Student, Optimizer=Optimizer, 
+                                TrainLoader=train_loader, ValLoader=val_loader, LossFn=LossFn, 
+                                LossIndicator=LossIndicator, Lambda=Lambda, device=device)
+    for e in range(args.num_epoch):
+        TrainResult = KD.TrainOneEpoch()
+        ValResult = KD.Validation()
 
 
 if __name__ == '__main__':
-    argparser = get_argparser()
-    main(argparser.parse_args())
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image_size', type=int, default=224, help='the height / width of the input image to network')
+    parser.add_argument('--params_dir', type=str, default="params", help='the directory of hyper parameters')
+    parser.add_argument('-m', '--model_name', type=str, default='base', help='the name of backbone network')
+    parser.add_argument('-t', '--teacher_name', type=str, default=None, help='the name of backbone network')
+    parser.add_argument('--lr', type=float, default=0.5, help='learning rate')
+    parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
+    parser.add_argument('--params_dir', type=str, default="params", help='the directory of hyper parameters')
+    parser.add_argument('--log_path', type=str, default='logs', help="directory to save train log")
+    parser.add_argument('--epoch', type=int, default=0, help='value of current epoch')
+    parser.add_argument('--batchsize', type=int, default=128, help='value of current epoch')
+    parser.add_argument('--num_epoch', type=int, default=90, help='the number of epoch in train')
+    parser.add_argument('--decay_epoch', type=int, default=30, help='the number of decay epoch in train')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help="path to saved models (to continue training)")
+    parser.add_argument('--num_classes', type=int, default=100, help='the number of classes')
+    parser.add_argument('--dataset', type=str, default='cifar100', help='the name of dataset')
+    parser.add_argument('--is_distill', type=bool, default=True)
+    args = parser.parse_args()
+    main(args)
+
+    # student_params = Params(os.path.join(args.params_dir, f'{args.model_name}.json'))
+    # if args.teacher_name is None:
+    #     teacher_params = Params(os.path.join(args.params_dir, f'{student_params.teacher_name}.json'))
+    # else:
+    #     teacher_params = Params(os.path.join(args.params_dir, f'{args.teacher_name}.json'))
+
+    # student = Model(args.num_classes, student_params, args.epoch)
+    # student.load_params(os.path.join(args.checkpoint_dir, args.dataset, student_params.model_name, f'{args.epoch-1}.pth'))
+
+    # teacher = Model(args.num_classes, teacher_params)
+    # teacher.load_params(os.path.join(args.checkpoint_dir, args.dataset, teacher_params.model_name, f'final.pth'))
+
+    # summary_title = f'{student_params.teacher_name}_teaches_{student_params.model_name} '
+
+    # if not os.path.exists(os.path.join(args.checkpoint_dir, args.dataset, student_params.model_name)):
+    #     os.makedirs(os.path.join(args.checkpoint_dir, args.dataset, student_params.model_name))
+    # if not os.path.exists(args.log_path):
+    #     os.makedirs(args.log_path)
+    # writer = SummaryWriter(args.log_path)
+
+    # criterion = loss_kd
+    # optimizer = torch.optim.Adam(student.parameters(), student_params.lr)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.decay_epoch)
+    # train_loader, validation_loader = get_loader(args.image_size, student_params.batch_size, args.dataset)
+    # scheduler.step(args.epoch)
+
+    # teacher_train_ans = teacher.fetch_output(train_loader)
+    # teacher_val_ans = teacher.fetch_output(validation_loader)
+
+    # for iter in range(args.epoch, args.num_epoch):
+    #     train_loss, train_acc = student.train_model(train_loader, criterion, optimizer, teacher_train_ans, student_params)
+    #     validation_loss, validation_acc = student.validate_model(validation_loader, criterion, teacher_val_ans, student_params)
+    #     writer.add_scalars(f'{summary_title}/Loss', {'train': train_loss, 'val': validation_loss}, iter)
+    #     writer.add_scalars(f'{summary_title}/Accuracy', {'train': train_acc, 'val': validation_acc}, iter)
+    #     torch.save(student.state_dict(), os.path.join(args.checkpoint_dir, args.dataset, student_params.model_name, f'{iter}.pth'))
+    #     scheduler.step()
