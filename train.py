@@ -28,7 +28,7 @@ def main(args):
     softloss = SoftLoss(T=4)
     LossFn = [F.cross_entropy, softloss]
     LossIndicator=["H", "S"]
-    Lambda=[0.5, 0.5]
+    Lambda=[1, 0]
     KD = KnowledgeDistilldation(Teacher=Teacher, Student=Student, Optimizer=Optimizer, \
                                 TrainLoader=train_loader, ValLoader=val_loader, LossFn=LossFn,\
                                 LossIndicator=LossIndicator, Lambda=Lambda, device=device)
@@ -46,7 +46,7 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cpu', help='cuda or cpu')
     parser.add_argument('--model_name', type=str, default='base', help='the name of backbone network')
     parser.add_argument('--teacher_name', type=str, default=None, help='the name of backbone network')
-    parser.add_argument('--lr', type=float, default=0.5, help='learning rate')
+    parser.add_argument('--lr', type=float, default=0.05, help='learning rate')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
     parser.add_argument('--params_dir', type=str, default="params", help='the directory of hyper parameters')
     parser.add_argument('--log_path', type=str, default='logs', help="directory to save train log")

@@ -59,18 +59,17 @@ class KnowledgeDistilldation(object):
         for data, target in tqdm(self.TrainLoader):
             Nsamples += target.size(0)
             data,target = data.to(self.device), target.to(self.device)
-            self.Optimizer.zero_grad()
             if self.__TeacherInList: TeacherOutput = [t(data) for t in self.Teacher]
             else: TeacherOutput = self.Teacher(data)
+            
             if self.__StudentInList: StudentOutput = [s(data) for s in self.Student]
             else: StudentOutput = self.Student(data)
             Losses = [None for _ in self.Lambda]
             RtLosses = [0 for _ in self.Lambda]
-            # breakpoint()
             if not(self.__TeacherInList and self.__TeacherInList):
                 ncc1, ncc5 = CurrectlyClassified(StudentOutput, target, (1,5))
-                Tncc1+=ncc1
-                Tncc5+=ncc5
+                Tncc1+=float(ncc1)
+                Tncc5+=float(ncc5)
                 # LossesForEachFn = []
                 for idx, lfn in enumerate(self.LossFn):
                     if self.__LossIndicator[idx] == "H":
@@ -92,6 +91,8 @@ class KnowledgeDistilldation(object):
                 # breakpoint()
                 if not Loss: Loss = l*self.Lambda[idx]
                 else: Loss += l*self.Lambda[idx]
+            
+            self.Optimizer.zero_grad()
             Loss.backward()
             self.Optimizer.step()
         RtLosses = [l/Nsamples for l in RtLosses]
