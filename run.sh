@@ -1,0 +1,1 @@
+python3 train.py --model_name resnet20 --teacher_name resnet56 --num_epoch 240 --device cuda

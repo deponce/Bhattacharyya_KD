@@ -1,7 +1,7 @@
 import torch 
 import torch.nn as nn
 import torchvision
-
+from tqdm import tqdm
 def CurrectlyClassified(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.inference_mode():
@@ -53,10 +53,10 @@ class KnowledgeDistilldation(object):
         Nsamples = 0
         # TODO: didn't consider multi teacher case
         self.Teacher.eval()
-        self.Student.Train()
+        self.Student.train()
         Tncc1 = 0
         Tncc5 = 0
-        for data, target in self.TrainLoader:
+        for data, target in tqdm(self.TrainLoader):
             Nsamples += target.size(0)
             data,target = data.to(self.device), target.to(self.device)
             self.Optimizer.zero_grad()
@@ -64,16 +64,18 @@ class KnowledgeDistilldation(object):
             else: TeacherOutput = self.Teacher(data)
             if self.__StudentInList: StudentOutput = [s(data) for s in self.Student]
             else: StudentOutput = self.Student(data)
-            Losses = [None for _ in len(self.LossFn)]
-            RtLosses = [0 for _ in len(self.LossFn)]
+            Losses = [None for _ in self.Lambda]
+            RtLosses = [0 for _ in self.Lambda]
+            # breakpoint()
             if not(self.__TeacherInList and self.__TeacherInList):
                 ncc1, ncc5 = CurrectlyClassified(StudentOutput, target, (1,5))
                 Tncc1+=ncc1
                 Tncc5+=ncc5
-                LossesForEachFn = []
-                for idx, lfn in enumerate(LossesForEachFn):
+                # LossesForEachFn = []
+                for idx, lfn in enumerate(self.LossFn):
                     if self.__LossIndicator[idx] == "H":
-                        LossVal = lfn(target, StudentOutput)
+                        # breakpoint()
+                        LossVal = lfn(StudentOutput, target)
                         
                     elif self.__LossIndicator[idx] == "S":
                         LossVal = lfn(TeacherOutput, StudentOutput)
@@ -87,6 +89,7 @@ class KnowledgeDistilldation(object):
             # if self.__StudentInList:  waiting for implement
             Loss = None
             for idx, l in enumerate(Losses):
+                # breakpoint()
                 if not Loss: Loss = l*self.Lambda[idx]
                 else: Loss += l*self.Lambda[idx]
             Loss.backward()
@@ -99,7 +102,7 @@ class KnowledgeDistilldation(object):
         self.Student.eval()
         Tncc1 = 0
         Tncc5 = 0
-        RtLosses = [0 for _ in len(self.LossFn)]
+        RtLosses = [0 for _ in self.Lambda]
         for data, target in self.ValLoader:
             Nsamples += target.size(0)
             data,target = data.to(self.device), target.to(self.device)
