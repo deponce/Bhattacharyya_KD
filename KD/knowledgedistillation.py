@@ -112,7 +112,7 @@ class KnowledgeDistilldation(object):
             Tncc5+=ncc5
             for idx, lfn in enumerate(self.LossFn):
                 if self.__LossIndicator[idx] == "H":
-                    LossVal = lfn(target, StudentOutput)
+                    LossVal = lfn(StudentOutput, target)
                     RtLosses[idx]+=float(LossVal)*target.size(0)
         RtLosses = [l/Nsamples for l in RtLosses]
         return {'Losses':RtLosses, 'Top1':Tncc1/Nsamples, "Top5": Tncc5/Nsamples}
